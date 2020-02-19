@@ -32,8 +32,6 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.rocksdb.ColumnFamilyHandle;
 
-import javax.annotation.Nullable;
-
 import java.math.BigInteger;
 import java.util.ArrayList;
 
@@ -71,9 +69,9 @@ public class RocksDBNativeMetricMonitorTest {
 		options.enableSizeAllMemTables();
 
 		RocksDBNativeMetricMonitor monitor = new RocksDBNativeMetricMonitor(
-			localRocksDBResource.getRocksDB(),
 			options,
-			group
+			group,
+			localRocksDBResource.getRocksDB()
 		);
 
 		ColumnFamilyHandle handle = localRocksDBResource.createNewColumnFamily(COLUMN_FAMILY_NAME);
@@ -116,9 +114,9 @@ public class RocksDBNativeMetricMonitorTest {
 		options.enableSizeAllMemTables();
 
 		RocksDBNativeMetricMonitor monitor = new RocksDBNativeMetricMonitor(
-			localRocksDBResource.getRocksDB(),
 			options,
-			group
+			group,
+			localRocksDBResource.getRocksDB()
 		);
 
 		ColumnFamilyHandle handle = rocksDBResource.createNewColumnFamily(COLUMN_FAMILY_NAME);
@@ -146,9 +144,9 @@ public class RocksDBNativeMetricMonitorTest {
 		options.enableSizeAllMemTables();
 
 		RocksDBNativeMetricMonitor monitor = new RocksDBNativeMetricMonitor(
-			rocksDBResource.getRocksDB(),
 			options,
-			group
+			group,
+			rocksDBResource.getRocksDB()
 		);
 
 		ColumnFamilyHandle handle = rocksDBResource.createNewColumnFamily(COLUMN_FAMILY_NAME);
@@ -167,11 +165,6 @@ public class RocksDBNativeMetricMonitorTest {
 
 		@Override
 		public char getDelimiter() {
-			return 0;
-		}
-
-		@Override
-		public char getDelimiter(int index) {
 			return 0;
 		}
 
@@ -202,12 +195,6 @@ public class RocksDBNativeMetricMonitorTest {
 			config.setString(MetricOptions.SCOPE_NAMING_OPERATOR, "D");
 
 			return ScopeFormats.fromConfig(config);
-		}
-
-		@Nullable
-		@Override
-		public String getMetricQueryServicePath() {
-			return null;
 		}
 	}
 }

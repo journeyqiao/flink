@@ -61,8 +61,7 @@ public class CheckpointingCustomKvStateProgram {
 		StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
 		env.setParallelism(parallelism);
-		env.getConfig().disableSysoutLogging();
-		env.enableCheckpointing(100);
+				env.enableCheckpointing(100);
 		env.setRestartStrategy(RestartStrategies.fixedDelayRestart(1, 1000));
 		env.setStateBackend(new FsStateBackend(checkpointPath));
 
@@ -226,11 +225,6 @@ public class CheckpointingCustomKvStateProgram {
 		@Override
 		public void copy(DataInputView source, DataOutputView target) throws IOException {
 			target.writeInt(source.readInt());
-		}
-
-		@Override
-		public boolean canEqual(Object obj) {
-			return obj instanceof CustomIntSerializer;
 		}
 
 		// -----------------------------------------------------------------------------------

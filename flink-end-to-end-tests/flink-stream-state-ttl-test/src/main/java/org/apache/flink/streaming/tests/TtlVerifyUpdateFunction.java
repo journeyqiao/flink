@@ -47,7 +47,6 @@ import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
-import static org.apache.flink.util.Preconditions.checkState;
 
 /**
  * Update state with TTL for each verifier.
@@ -70,7 +69,6 @@ class TtlVerifyUpdateFunction extends RichFlatMapFunction<TtlStateUpdate, String
 
 	@Nonnull
 	private final StateTtlConfig ttlConfig;
-	private final MonotonicTTLTimeProvider ttlTimeProvider;
 	private final UpdateStat stat;
 
 	private transient Map<String, State> states;
@@ -78,10 +76,8 @@ class TtlVerifyUpdateFunction extends RichFlatMapFunction<TtlStateUpdate, String
 
 	TtlVerifyUpdateFunction(
 			@Nonnull StateTtlConfig ttlConfig,
-			MonotonicTTLTimeProvider ttlTimeProvider,
 			long reportStatAfterUpdatesNum) {
 		this.ttlConfig = ttlConfig;
-		this.ttlTimeProvider = checkNotNull(ttlTimeProvider);
 		this.stat = new UpdateStat(reportStatAfterUpdatesNum);
 	}
 
@@ -90,7 +86,8 @@ class TtlVerifyUpdateFunction extends RichFlatMapFunction<TtlStateUpdate, String
 		for (TtlStateVerifier<?, ?> verifier : TtlStateVerifier.VERIFIERS) {
 			TtlVerificationContext<?, ?> verificationContext = generateUpdateAndVerificationContext(updates, verifier);
 			if (!verifier.verify(verificationContext)) {
-				out.collect(verificationContext.toString());
+				// Please do **NOT** change the prefix, it's used in test_stream_state_ttl.sh for test verifying
+				out.collect("TTL verification failed: " + verificationContext.toString());
 			}
 		}
 	}
@@ -117,19 +114,13 @@ class TtlVerifyUpdateFunction extends RichFlatMapFunction<TtlStateUpdate, String
 			TtlStateVerifier<?, ?> verifier,
 			Object update) throws Exception {
 
-		final long timestampBeforeUpdate = ttlTimeProvider.currentTimestamp();
-		State state = states.get(verifier.getId());
-		Object valueBeforeUpdate = verifier.get(state);
-		verifier.update(state, update);
-		Object updatedValue = verifier.get(state);
-		final long timestampAfterUpdate = ttlTimeProvider.unfreezeTime();
-
-		checkState(
-				timestampAfterUpdate == timestampBeforeUpdate,
-				"Timestamps before and after the update do not match."
-		);
-
-		return new TtlUpdateContext<>(valueBeforeUpdate, update, updatedValue, timestampAfterUpdate);
+		return MonotonicTTLTimeProvider.doWithFrozenTime(frozenTimestamp -> {
+			State state = states.get(verifier.getId());
+			Object valueBeforeUpdate = verifier.get(state);
+			verifier.update(state, update);
+			Object updatedValue = verifier.get(state);
+			return new TtlUpdateContext<>(valueBeforeUpdate, update, updatedValue, frozenTimestamp);
+		});
 	}
 
 	@Override

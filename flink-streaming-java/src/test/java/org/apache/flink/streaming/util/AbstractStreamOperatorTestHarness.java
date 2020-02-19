@@ -52,15 +52,22 @@ import org.apache.flink.streaming.api.operators.AbstractStreamOperatorTest;
 import org.apache.flink.streaming.api.operators.OperatorSnapshotFinalizer;
 import org.apache.flink.streaming.api.operators.OperatorSnapshotFutures;
 import org.apache.flink.streaming.api.operators.Output;
+import org.apache.flink.streaming.api.operators.SetupableStreamOperator;
+import org.apache.flink.streaming.api.operators.SimpleOperatorFactory;
 import org.apache.flink.streaming.api.operators.StreamOperator;
+import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
+import org.apache.flink.streaming.api.operators.StreamOperatorFactoryUtil;
 import org.apache.flink.streaming.api.operators.StreamTaskStateInitializer;
 import org.apache.flink.streaming.api.operators.StreamTaskStateInitializerImpl;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.LatencyMarker;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.runtime.streamstatus.StreamStatus;
 import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
 import org.apache.flink.streaming.runtime.tasks.StreamTask;
 import org.apache.flink.streaming.runtime.tasks.TestProcessingTimeService;
+import org.apache.flink.streaming.runtime.tasks.mailbox.TaskMailbox;
+import org.apache.flink.streaming.runtime.tasks.mailbox.TaskMailboxImpl;
 import org.apache.flink.util.OutputTag;
 import org.apache.flink.util.Preconditions;
 
@@ -75,6 +82,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
 
 import static org.apache.flink.util.Preconditions.checkState;
 
@@ -83,7 +91,9 @@ import static org.apache.flink.util.Preconditions.checkState;
  */
 public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 
-	protected final StreamOperator<OUT> operator;
+	protected StreamOperator<OUT> operator;
+
+	protected final StreamOperatorFactory<OUT> factory;
 
 	protected final ConcurrentLinkedQueue<Object> outputList;
 
@@ -95,7 +105,7 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 
 	protected final TestProcessingTimeService processingTimeService;
 
-	protected final MockStreamTask mockTask;
+	protected final MockStreamTask<OUT, ?> mockTask;
 
 	protected final TestTaskStateManager taskStateManager;
 
@@ -107,13 +117,15 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 
 	CloseableRegistry closableRegistry;
 
+	private final TaskMailbox taskMailbox;
+
 	// use this as default for tests
 	protected StateBackend stateBackend = new MemoryStateBackend();
 	private CheckpointStorage checkpointStorage = stateBackend.createCheckpointStorage(new JobID());
 
 	private final Object checkpointLock;
 
-	private final OperatorStateRepartitioner operatorStateRepartitioner =
+	private static final OperatorStateRepartitioner operatorStateRepartitioner =
 			RoundRobinOperatorStateRepartitioner.INSTANCE;
 
 	/**
@@ -144,32 +156,76 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 			int subtaskIndex,
 			OperatorID operatorID) throws Exception {
 		this(
-			operator,
-			new MockEnvironmentBuilder()
-				.setTaskName("MockTask")
-				.setMemorySize(3 * 1024 * 1024)
-				.setInputSplitProvider(new MockInputSplitProvider())
-				.setBufferSize(1024)
-				.setMaxParallelism(maxParallelism)
-				.setParallelism(parallelism)
-				.setSubtaskIndex(subtaskIndex)
-				.build(),
-			true,
-			operatorID);
+				operator,
+				SimpleOperatorFactory.of(operator),
+				new MockEnvironmentBuilder()
+						.setTaskName("MockTask")
+						.setManagedMemorySize(3 * 1024 * 1024)
+						.setInputSplitProvider(new MockInputSplitProvider())
+						.setBufferSize(1024)
+						.setMaxParallelism(maxParallelism)
+						.setParallelism(parallelism)
+						.setSubtaskIndex(subtaskIndex)
+						.build(),
+				true,
+				operatorID);
+	}
+
+	public AbstractStreamOperatorTestHarness(
+			StreamOperatorFactory<OUT> factory,
+			MockEnvironment env) throws Exception {
+		this(null, factory, env, false, new OperatorID());
+	}
+
+	public AbstractStreamOperatorTestHarness(
+			StreamOperatorFactory<OUT> factory,
+			int maxParallelism,
+			int parallelism,
+			int subtaskIndex) throws Exception {
+		this(
+				factory,
+				maxParallelism,
+				parallelism,
+				subtaskIndex,
+				new OperatorID());
+	}
+
+	public AbstractStreamOperatorTestHarness(
+			StreamOperatorFactory<OUT> factory,
+			int maxParallelism,
+			int parallelism,
+			int subtaskIndex,
+			OperatorID operatorID) throws Exception {
+		this(
+				null,
+				factory,
+				new MockEnvironmentBuilder()
+						.setTaskName("MockTask")
+						.setManagedMemorySize(3 * 1024 * 1024)
+						.setInputSplitProvider(new MockInputSplitProvider())
+						.setBufferSize(1024)
+						.setMaxParallelism(maxParallelism)
+						.setParallelism(parallelism)
+						.setSubtaskIndex(subtaskIndex)
+						.build(),
+				true,
+				operatorID);
 	}
 
 	public AbstractStreamOperatorTestHarness(
 			StreamOperator<OUT> operator,
 			MockEnvironment env) throws Exception {
-		this(operator, env, false, new OperatorID());
+		this(operator, SimpleOperatorFactory.of(operator), env, false, new OperatorID());
 	}
 
 	private AbstractStreamOperatorTestHarness(
 			StreamOperator<OUT> operator,
+			StreamOperatorFactory<OUT> factory,
 			MockEnvironment env,
 			boolean environmentIsInternal,
 			OperatorID operatorID) throws Exception {
 		this.operator = operator;
+		this.factory = factory;
 		this.outputList = new ConcurrentLinkedQueue<>();
 		this.sideOutputLists = new HashMap<>();
 
@@ -195,6 +251,8 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 			wasFailedExternally = true;
 		};
 
+		this.taskMailbox = new TaskMailboxImpl();
+
 		mockTask = new MockStreamTaskBuilder(env)
 			.setCheckpointLock(checkpointLock)
 			.setConfig(config)
@@ -202,8 +260,9 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 			.setStreamTaskStateInitializer(streamTaskStateInitializer)
 			.setClosableRegistry(closableRegistry)
 			.setCheckpointStorage(checkpointStorage)
-			.setProcessingTimeService(processingTimeService)
+			.setTimerService(processingTimeService)
 			.setHandleAsyncException(handleAsyncException)
+			.setTaskMailbox(taskMailbox)
 			.build();
 	}
 
@@ -213,8 +272,7 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 		ProcessingTimeService processingTimeService) {
 		return new StreamTaskStateInitializerImpl(
 			env,
-			stateBackend,
-			processingTimeService);
+			stateBackend);
 	}
 
 	public void setStateBackend(StateBackend stateBackend) {
@@ -227,6 +285,10 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 		}
 	}
 
+	/**
+	 * @deprecated Checkpoint lock in {@link StreamTask} is replaced by {@link org.apache.flink.streaming.runtime.tasks.StreamTaskActionExecutor StreamTaskActionExecutor}.
+	 */
+	@Deprecated
 	public Object getCheckpointLock() {
 		return mockTask.getCheckpointLock();
 	}
@@ -237,6 +299,10 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 
 	public ExecutionConfig getExecutionConfig() {
 		return executionConfig;
+	}
+
+	public StreamConfig getStreamConfig() {
+		return config;
 	}
 
 	/**
@@ -266,33 +332,49 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 	}
 
 	/**
-	 * Calls {@link StreamOperator#setup(StreamTask, StreamConfig, Output)} ()}.
+	 * Get the list of OUT values emitted by the operator.
+	 */
+	public List<OUT> extractOutputValues(){
+		List<StreamRecord<? extends OUT>> streamRecords = extractOutputStreamRecords();
+		List<OUT> outputValues = new ArrayList<>();
+		for (StreamRecord<? extends OUT> streamRecord : streamRecords) {
+			outputValues.add(streamRecord.getValue());
+		}
+		return outputValues;
+	}
+
+	/**
+	 * Calls {@link SetupableStreamOperator#setup(StreamTask, StreamConfig, Output)} ()}.
 	 */
 	public void setup() {
 		setup(null);
 	}
 
 	/**
-	 * Calls {@link StreamOperator#setup(StreamTask, StreamConfig, Output)} ()}.
+	 * Calls {@link SetupableStreamOperator#setup(StreamTask, StreamConfig, Output)} ()}.
 	 */
 	public void setup(TypeSerializer<OUT> outputSerializer) {
 		if (!setupCalled) {
 			streamTaskStateInitializer =
 				createStreamTaskStateManager(environment, stateBackend, processingTimeService);
 			mockTask.setStreamTaskStateInitializer(streamTaskStateInitializer);
-			operator.setup(mockTask, config, new MockOutput(outputSerializer));
+
+			if (operator == null) {
+				this.operator = StreamOperatorFactoryUtil.createOperator(factory, mockTask, config,
+						new MockOutput(outputSerializer));
+			} else if (operator instanceof SetupableStreamOperator) {
+				((SetupableStreamOperator) operator).setup(mockTask, config, new MockOutput(outputSerializer));
+			}
 			setupCalled = true;
+			this.mockTask.init();
 		}
 	}
 
 	/**
 	 * Calls {@link org.apache.flink.streaming.api.operators.StreamOperator#initializeState()}.
-	 * Calls {@link org.apache.flink.streaming.api.operators.StreamOperator#setup(StreamTask, StreamConfig, Output)}
+	 * Calls {@link org.apache.flink.streaming.api.operators.SetupableStreamOperator#setup(StreamTask, StreamConfig, Output)}
 	 * if it was not called before.
 	 *
-	 * <p>This will reshape the state handles to include only those key-group states
-	 * in the local key-group range and the operator states that would be assigned to the local
-	 * subtask.
 	 */
 	public void initializeState(OperatorSubtaskState operatorStateHandles) throws Exception {
 		initializeState(operatorStateHandles, null);
@@ -307,8 +389,74 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 	}
 
 	/**
+	 * Returns the reshaped the state handles to include only those key-group states in the local key-group range
+	 * and the operator states that would be assigned to the local subtask.
+	 */
+	public static OperatorSubtaskState repartitionOperatorState(
+		final OperatorSubtaskState operatorStateHandles,
+		final int numKeyGroups,
+		final int oldParallelism,
+		final int newParallelism,
+		final int subtaskIndex) {
+
+		Preconditions.checkNotNull(operatorStateHandles, "the previous operatorStateHandles should not be null.");
+
+		// create a new OperatorStateHandles that only contains the state for our key-groups
+
+		List<KeyGroupRange> keyGroupPartitions = StateAssignmentOperation.createKeyGroupPartitions(
+			numKeyGroups,
+			newParallelism);
+
+		KeyGroupRange localKeyGroupRange = keyGroupPartitions.get(subtaskIndex);
+
+		List<KeyedStateHandle> localManagedKeyGroupState = StateAssignmentOperation.getKeyedStateHandles(
+			operatorStateHandles.getManagedKeyedState(),
+			localKeyGroupRange);
+
+		List<KeyedStateHandle> localRawKeyGroupState = StateAssignmentOperation.getKeyedStateHandles(
+			operatorStateHandles.getRawKeyedState(),
+			localKeyGroupRange);
+
+		StateObjectCollection<OperatorStateHandle> managedOperatorStates = operatorStateHandles.getManagedOperatorState();
+		Collection<OperatorStateHandle> localManagedOperatorState;
+
+		if (!managedOperatorStates.isEmpty()) {
+			List<List<OperatorStateHandle>> managedOperatorState =
+				managedOperatorStates.stream().map(Collections::singletonList).collect(Collectors.toList());
+
+			localManagedOperatorState = operatorStateRepartitioner.repartitionState(
+				managedOperatorState,
+				oldParallelism,
+				newParallelism).get(subtaskIndex);
+		} else {
+			localManagedOperatorState = Collections.emptyList();
+		}
+
+		StateObjectCollection<OperatorStateHandle> rawOperatorStates = operatorStateHandles.getRawOperatorState();
+		Collection<OperatorStateHandle> localRawOperatorState;
+
+		if (!rawOperatorStates.isEmpty()) {
+			List<List<OperatorStateHandle>> rawOperatorState =
+				rawOperatorStates.stream().map(Collections::singletonList).collect(Collectors.toList());
+
+			localRawOperatorState = operatorStateRepartitioner.repartitionState(
+				rawOperatorState,
+				oldParallelism,
+				newParallelism).get(subtaskIndex);
+		} else {
+			localRawOperatorState = Collections.emptyList();
+		}
+
+		return new OperatorSubtaskState(
+			new StateObjectCollection<>(nullToEmptyCollection(localManagedOperatorState)),
+			new StateObjectCollection<>(nullToEmptyCollection(localRawOperatorState)),
+			new StateObjectCollection<>(nullToEmptyCollection(localManagedKeyGroupState)),
+			new StateObjectCollection<>(nullToEmptyCollection(localRawKeyGroupState)));
+	}
+
+	/**
 	 * Calls {@link org.apache.flink.streaming.api.operators.StreamOperator#initializeState()}.
-	 * Calls {@link org.apache.flink.streaming.api.operators.StreamOperator#setup(StreamTask, StreamConfig, Output)}
+	 * Calls {@link org.apache.flink.streaming.api.operators.SetupableStreamOperator#setup(StreamTask, StreamConfig, Output)}
 	 * if it was not called before.
 	 *
 	 * @param jmOperatorStateHandles the primary state (owned by JM)
@@ -326,50 +474,9 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 		}
 
 		if (jmOperatorStateHandles != null) {
-			int numKeyGroups = getEnvironment().getTaskInfo().getMaxNumberOfParallelSubtasks();
-			int numSubtasks = getEnvironment().getTaskInfo().getNumberOfParallelSubtasks();
-			int subtaskIndex = getEnvironment().getTaskInfo().getIndexOfThisSubtask();
-
-			// create a new OperatorStateHandles that only contains the state for our key-groups
-
-			List<KeyGroupRange> keyGroupPartitions = StateAssignmentOperation.createKeyGroupPartitions(
-				numKeyGroups,
-				numSubtasks);
-
-			KeyGroupRange localKeyGroupRange = keyGroupPartitions.get(subtaskIndex);
-
-			List<KeyedStateHandle> localManagedKeyGroupState = StateAssignmentOperation.getKeyedStateHandles(
-				jmOperatorStateHandles.getManagedKeyedState(),
-				localKeyGroupRange);
-
-			List<KeyedStateHandle> localRawKeyGroupState = StateAssignmentOperation.getKeyedStateHandles(
-				jmOperatorStateHandles.getRawKeyedState(),
-				localKeyGroupRange);
-
-			List<OperatorStateHandle> managedOperatorState = new ArrayList<>();
-
-			managedOperatorState.addAll(jmOperatorStateHandles.getManagedOperatorState());
-
-			Collection<OperatorStateHandle> localManagedOperatorState = operatorStateRepartitioner.repartitionState(
-				managedOperatorState,
-				numSubtasks).get(subtaskIndex);
-
-			List<OperatorStateHandle> rawOperatorState = new ArrayList<>();
-
-			rawOperatorState.addAll(jmOperatorStateHandles.getRawOperatorState());
-
-			Collection<OperatorStateHandle> localRawOperatorState = operatorStateRepartitioner.repartitionState(
-				rawOperatorState,
-				numSubtasks).get(subtaskIndex);
-
-			OperatorSubtaskState processedJmOpSubtaskState = new OperatorSubtaskState(
-				new StateObjectCollection<>(nullToEmptyCollection(localManagedOperatorState)),
-				new StateObjectCollection<>(nullToEmptyCollection(localRawOperatorState)),
-				new StateObjectCollection<>(nullToEmptyCollection(localManagedKeyGroupState)),
-				new StateObjectCollection<>(nullToEmptyCollection(localRawKeyGroupState)));
 
 			TaskStateSnapshot jmTaskStateSnapshot = new TaskStateSnapshot();
-			jmTaskStateSnapshot.putSubtaskStateByOperatorID(operator.getOperatorID(), processedJmOpSubtaskState);
+			jmTaskStateSnapshot.putSubtaskStateByOperatorID(operator.getOperatorID(), jmOperatorStateHandles);
 
 			taskStateManager.setReportedCheckpointId(0);
 			taskStateManager.setJobManagerTaskStateSnapshotsByCheckpointId(
@@ -397,8 +504,10 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 	 * and repacks them into a single {@link OperatorSubtaskState} so that the parallelism of the test
 	 * can change arbitrarily (i.e. be able to scale both up and down).
 	 *
-	 * <p>After repacking the partial states, use {@link #initializeState(OperatorSubtaskState)} to initialize
-	 * a new instance with the resulting state. Bear in mind that for parallelism greater than one, you
+	 * <p>After repacking the partial states, remember to use
+	 * {@link #repartitionOperatorState(OperatorSubtaskState, int, int, int, int)} to reshape the state handles
+	 * to include only those key-group states in the local key-group range and the operator states that would
+	 * be assigned to the local subtask. Bear in mind that for parallelism greater than one, you
 	 * have to use the constructor {@link #AbstractStreamOperatorTestHarness(StreamOperator, int, int, int)}.
 	 *
 	 * <p><b>NOTE: </b> each of the {@code handles} in the argument list is assumed to be from a single task of a single
@@ -446,7 +555,7 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 
 	/**
 	 * Calls {@link StreamOperator#open()}. This also
-	 * calls {@link StreamOperator#setup(StreamTask, StreamConfig, Output)}
+	 * calls {@link SetupableStreamOperator#setup(StreamTask, StreamConfig, Output)}
 	 * if it was not called before.
 	 */
 	public void open() throws Exception {
@@ -454,6 +563,13 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 			initializeEmptyState();
 		}
 		operator.open();
+	}
+
+	/**
+	 * Calls {@link StreamOperator#prepareSnapshotPreBarrier(long)}.
+	 */
+	public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+		operator.prepareSnapshotPreBarrier(checkpointId);
 	}
 
 	/**
@@ -495,7 +611,10 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 		}
 		setupCalled = false;
 
-		internalEnvironment.ifPresent(MockEnvironment::close);
+		if (internalEnvironment.isPresent()) {
+			internalEnvironment.get().close();
+		}
+		mockTask.cleanup();
 	}
 
 	public void setProcessingTime(long time) throws Exception {
@@ -534,6 +653,21 @@ public class AbstractStreamOperatorTestHarness<OUT> implements AutoCloseable {
 		} else {
 			throw new UnsupportedOperationException();
 		}
+	}
+
+	@VisibleForTesting
+	public TestProcessingTimeService getProcessingTimeService() {
+		return processingTimeService;
+	}
+
+	@VisibleForTesting
+	public StreamStatus getStreamStatus() {
+		return mockTask.getStreamStatusMaintainer().getStreamStatus();
+	}
+
+	@VisibleForTesting
+	public TaskMailbox getTaskMailbox() {
+		return taskMailbox;
 	}
 
 	private class MockOutput implements Output<StreamRecord<OUT>> {

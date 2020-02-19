@@ -22,12 +22,18 @@ import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.accumulators.Accumulator;
 import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.runtime.execution.Environment;
-import org.apache.flink.runtime.state.CheckpointStorage;
+import org.apache.flink.runtime.state.CheckpointStorageWorkerView;
+import org.apache.flink.runtime.util.FatalExitExceptionHandler;
 import org.apache.flink.streaming.api.graph.StreamConfig;
+import org.apache.flink.streaming.api.operators.StreamOperator;
 import org.apache.flink.streaming.api.operators.StreamTaskStateInitializer;
 import org.apache.flink.streaming.runtime.streamstatus.StreamStatusMaintainer;
 import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
 import org.apache.flink.streaming.runtime.tasks.StreamTask;
+import org.apache.flink.streaming.runtime.tasks.StreamTaskActionExecutor;
+import org.apache.flink.streaming.runtime.tasks.TimerService;
+import org.apache.flink.streaming.runtime.tasks.mailbox.MailboxDefaultAction;
+import org.apache.flink.streaming.runtime.tasks.mailbox.TaskMailbox;
 
 import java.util.Map;
 import java.util.function.BiConsumer;
@@ -35,7 +41,7 @@ import java.util.function.BiConsumer;
 /**
  * A settable testing {@link StreamTask}.
  */
-public class MockStreamTask extends StreamTask {
+public class MockStreamTask<OUT, OP extends StreamOperator<OUT>> extends StreamTask<OUT, OP> {
 
 	private final String name;
 	private final Object checkpointLock;
@@ -44,7 +50,7 @@ public class MockStreamTask extends StreamTask {
 	private StreamTaskStateInitializer streamTaskStateInitializer;
 	private final CloseableRegistry closableRegistry;
 	private final StreamStatusMaintainer streamStatusMaintainer;
-	private final CheckpointStorage checkpointStorage;
+	private final CheckpointStorageWorkerView checkpointStorage;
 	private final ProcessingTimeService processingTimeService;
 	private final BiConsumer<String, Throwable> handleAsyncException;
 	private final Map<String, Accumulator<?, ?>> accumulatorMap;
@@ -58,12 +64,14 @@ public class MockStreamTask extends StreamTask {
 		StreamTaskStateInitializer streamTaskStateInitializer,
 		CloseableRegistry closableRegistry,
 		StreamStatusMaintainer streamStatusMaintainer,
-		CheckpointStorage checkpointStorage,
-		ProcessingTimeService processingTimeService,
+		CheckpointStorageWorkerView checkpointStorage,
+		TimerService timerService,
 		BiConsumer<String, Throwable> handleAsyncException,
-		Map<String, Accumulator<?, ?>> accumulatorMap
+		Map<String, Accumulator<?, ?>> accumulatorMap,
+		TaskMailbox taskMailbox,
+		StreamTaskActionExecutor.SynchronizedStreamTaskActionExecutor taskActionExecutor
 	) {
-		super(environment);
+		super(environment, timerService, FatalExitExceptionHandler.INSTANCE, taskActionExecutor, taskMailbox);
 		this.name = name;
 		this.checkpointLock = checkpointLock;
 		this.config = config;
@@ -72,29 +80,35 @@ public class MockStreamTask extends StreamTask {
 		this.closableRegistry = closableRegistry;
 		this.streamStatusMaintainer = streamStatusMaintainer;
 		this.checkpointStorage = checkpointStorage;
-		this.processingTimeService = processingTimeService;
+		this.processingTimeService = timerService;
 		this.handleAsyncException = handleAsyncException;
 		this.accumulatorMap = accumulatorMap;
 	}
 
 	@Override
-	public void init() { }
+	public void init() {
+	}
 
 	@Override
-	protected void run() { }
+	protected void processInput(MailboxDefaultAction.Controller controller) throws Exception {
+		controller.allActionsCompleted();
+	}
 
 	@Override
-	protected void cleanup() { }
-
-	@Override
-	protected void cancelTask() { }
+	protected void cleanup() {
+		mailboxProcessor.allActionsCompleted();
+	}
 
 	@Override
 	public String getName() {
 		return name;
 	}
 
-	@Override
+	/**
+	 * Checkpoint lock in {@link StreamTask} is replaced by {@link StreamTaskActionExecutor}.
+	 * <code>getCheckpointLock</code> method was moved from to the {@link org.apache.flink.streaming.runtime.tasks.SourceStreamTask SourceStreamTask}.
+	 */
+	@Deprecated
 	public Object getCheckpointLock() {
 		return checkpointLock;
 	}
@@ -134,13 +148,8 @@ public class MockStreamTask extends StreamTask {
 	}
 
 	@Override
-	public CheckpointStorage getCheckpointStorage() {
+	public CheckpointStorageWorkerView getCheckpointStorage() {
 		return checkpointStorage;
-	}
-
-	@Override
-	public ProcessingTimeService getProcessingTimeService() {
-		return processingTimeService;
 	}
 
 	@Override
@@ -151,5 +160,10 @@ public class MockStreamTask extends StreamTask {
 	@Override
 	public Map<String, Accumulator<?, ?>> getAccumulatorMap() {
 		return accumulatorMap;
+	}
+
+	@Override
+	public ProcessingTimeService getProcessingTimeService(int operatorIndex) {
+		return processingTimeService;
 	}
 }

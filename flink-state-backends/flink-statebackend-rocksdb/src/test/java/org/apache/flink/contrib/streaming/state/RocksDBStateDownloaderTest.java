@@ -20,8 +20,7 @@ package org.apache.flink.contrib.streaming.state;
 
 import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.core.fs.FSDataInputStream;
-import org.apache.flink.core.fs.Path;
-import org.apache.flink.runtime.state.IncrementalKeyedStateHandle;
+import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.StateHandleID;
 import org.apache.flink.runtime.state.StreamStateHandle;
@@ -34,6 +33,7 @@ import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -79,8 +79,8 @@ public class RocksDBStateDownloaderTest extends TestLogger {
 		Map<StateHandleID, StreamStateHandle> stateHandles = new HashMap<>(1);
 		stateHandles.put(new StateHandleID("state1"), stateHandle);
 
-		IncrementalKeyedStateHandle incrementalKeyedStateHandle =
-			new IncrementalKeyedStateHandle(
+		IncrementalRemoteKeyedStateHandle incrementalKeyedStateHandle =
+			new IncrementalRemoteKeyedStateHandle(
 				UUID.randomUUID(),
 				KeyGroupRange.EMPTY_KEY_GROUP_RANGE,
 				1,
@@ -91,7 +91,7 @@ public class RocksDBStateDownloaderTest extends TestLogger {
 		try (RocksDBStateDownloader rocksDBStateDownloader = new RocksDBStateDownloader(5)) {
 			rocksDBStateDownloader.transferAllStateDataToDirectory(
 				incrementalKeyedStateHandle,
-				new Path(temporaryFolder.newFolder().toURI()),
+				temporaryFolder.newFolder().toPath(),
 				new CloseableRegistry());
 			fail();
 		} catch (Exception e) {
@@ -124,8 +124,8 @@ public class RocksDBStateDownloaderTest extends TestLogger {
 			privateStates.put(new StateHandleID(String.format("privateState%d", i)), handles.get(i));
 		}
 
-		IncrementalKeyedStateHandle incrementalKeyedStateHandle =
-			new IncrementalKeyedStateHandle(
+		IncrementalRemoteKeyedStateHandle incrementalKeyedStateHandle =
+			new IncrementalRemoteKeyedStateHandle(
 				UUID.randomUUID(),
 				KeyGroupRange.of(0, 1),
 				1,
@@ -133,13 +133,13 @@ public class RocksDBStateDownloaderTest extends TestLogger {
 				privateStates,
 				handles.get(0));
 
-		Path dstPath = new Path(temporaryFolder.newFolder().toURI());
+		Path dstPath = temporaryFolder.newFolder().toPath();
 		try (RocksDBStateDownloader rocksDBStateDownloader = new RocksDBStateDownloader(5)) {
 			rocksDBStateDownloader.transferAllStateDataToDirectory(incrementalKeyedStateHandle, dstPath, new CloseableRegistry());
 		}
 
 		for (int i = 0; i < contentNum; ++i) {
-			assertStateContentEqual(contents[i], new Path(dstPath, String.format("sharedState%d", i)));
+			assertStateContentEqual(contents[i], dstPath.resolve(String.format("sharedState%d", i)));
 		}
 	}
 
